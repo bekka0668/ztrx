@@ -1212,6 +1212,16 @@ extern "system" fn clear_rtv(
         ) else {
             return;
         };
+        if !crate::host::renders_to(texture) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    resource = format_args!("{:#x}", record.resource as usize),
+                    "clear of a render target the host cannot render to: skipped"
+                )
+            });
+            return;
+        }
         // SAFETY: the title passes four floats (null is tolerated).
         let Some(color) = (unsafe { color.as_ref() }) else {
             return;
@@ -1284,6 +1294,156 @@ extern "system" fn clear_dsv(
     }
     #[cfg(not(windows))]
     let _ = (this, handle, flags, depth, stencil, count, rects);
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DiscardRegion {
+    num_rects: u32,
+    rects: *const Rect,
+    first_subresource: u32,
+    num_subresources: u32,
+}
+
+#[cfg(windows)]
+const _: () = {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Direct3D12::D3D12_DISCARD_REGION;
+    assert!(size_of::<DiscardRegion>() == size_of::<D3D12_DISCARD_REGION>());
+    assert!(align_of::<DiscardRegion>() == align_of::<D3D12_DISCARD_REGION>());
+    assert!(size_of::<Rect>() == size_of::<RECT>());
+    assert!(align_of::<Rect>() == align_of::<RECT>());
+};
+
+#[cfg(any(windows, test))]
+fn discard_state_allowed(state: u32, flags: u32) -> bool {
+    let required_flag = match state {
+        0x4 => 0x1,  // RENDER_TARGET
+        0x10 => 0x2, // DEPTH_WRITE / ALLOW_DEPTH_STENCIL
+        0x8 => 0x4,  // UNORDERED_ACCESS
+        _ => return false,
+    };
+    flags & required_flag != 0
+}
+
+#[cfg(any(windows, test))]
+unsafe fn valid_discard_region(
+    region: Option<&DiscardRegion>,
+    dimension: u32,
+    mip_levels: u16,
+    depth_or_array_size: u16,
+    planes: u8,
+    extent: [u64; 2],
+) -> bool {
+    const TEXTURE_2D: u32 = 3;
+    const TEXTURE_3D: u32 = 4;
+    let Some(region) = region else { return true };
+    let mips = u64::from(mip_levels.max(1));
+    let slices = if dimension == TEXTURE_3D {
+        1
+    } else {
+        u64::from(depth_or_array_size.max(1))
+    };
+    let first = u64::from(region.first_subresource);
+    let count = u64::from(region.num_subresources);
+    if count == 0 || first + count > mips * slices * u64::from(planes) {
+        return false;
+    }
+    if region.num_rects == 0 {
+        return true;
+    }
+    let rects = region.num_rects as usize;
+    if dimension != TEXTURE_2D
+        || (mips > 1 && count > 1)
+        || region.rects.is_null()
+        || !region.rects.is_aligned()
+        || rects > isize::MAX as usize / size_of::<Rect>()
+    {
+        return false;
+    }
+    let [width, height] =
+        extent.map(|size| size.checked_shr((first % mips) as u32).unwrap_or(0).max(1));
+    // SAFETY: the caller supplies the array, and its pointer and size were checked.
+    unsafe { std::slice::from_raw_parts(region.rects, rects) }
+        .iter()
+        .all(|r| {
+            r.left >= 0
+                && r.top >= 0
+                && r.left < r.right
+                && r.top < r.bottom
+                && r.right as u64 <= width
+                && r.bottom as u64 <= height
+        })
+}
+
+extern "system" fn discard_resource(this: This, resource: This, region: *const DiscardRegion) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let (Some(list), Some(copy)) = (host_list(this), crate::resource::host_copy(resource))
+        else {
+            return;
+        };
+        let Some(state) = list.tracked_texture_state(&copy) else {
+            return;
+        };
+        // SAFETY: a live host texture.
+        let desc = unsafe { copy.texture.GetDesc() };
+        if !discard_state_allowed(state, desc.Flags.0 as u32) || !region.is_aligned() {
+            return;
+        }
+        // SAFETY: the title passes a discard region or null.
+        let region = unsafe { region.as_ref() };
+        if let Some(region) = region {
+            let Some(host) = crate::host::host() else {
+                return;
+            };
+            let mut format = D3D12_FEATURE_DATA_FORMAT_INFO {
+                Format: desc.Format,
+                PlaneCount: 0,
+            };
+            // SAFETY: the feature data matches the requested query.
+            if unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_INFO,
+                    (&raw mut format).cast(),
+                    size_of::<D3D12_FEATURE_DATA_FORMAT_INFO>() as u32,
+                )
+            }
+            .is_err()
+            {
+                return;
+            }
+            // SAFETY: the title supplies the rectangles described by the region.
+            let valid = unsafe {
+                valid_discard_region(
+                    Some(region),
+                    desc.Dimension.0 as u32,
+                    desc.MipLevels,
+                    desc.DepthOrArraySize,
+                    format.PlaneCount,
+                    [desc.Width, desc.Height as u64],
+                )
+            };
+            if !valid {
+                return;
+            }
+        }
+        let region = region.map(|r| D3D12_DISCARD_REGION {
+            NumRects: r.num_rects,
+            // SAFETY: Rect has identical layout and alignment to RECT.
+            pRects: r.rects.cast(),
+            FirstSubresource: r.first_subresource,
+            NumSubresources: r.num_subresources,
+        });
+        // SAFETY: an open list and a live host texture in a matching discard state.
+        unsafe {
+            list.list
+                .DiscardResource(&copy.texture, region.as_ref().map(std::ptr::from_ref));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (this, resource, region);
 }
 
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
@@ -2054,7 +2214,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 52] = [
+const METHODS: [(usize, *const ()); 53] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -2095,6 +2255,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
+    (55, discard_resource as *const ()),          // 0x1b8
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
     (68, depth_bounds as *const ()),              // 0x220 depth bounds

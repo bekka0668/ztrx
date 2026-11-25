@@ -1733,7 +1733,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         return false;
     }
     // Every family has more than one format, its typeless one first.
-    let typeless = family(own) == own && family(own + 1) == own;
+    let typeless = crate::resource::is_typeless(own);
     if let Some(format) = format.as_deref_mut()
         && unordered
         && let Some(&(_, linear)) = crate::resource::SRGB
@@ -1744,7 +1744,14 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        if typeless {
+            if let Some(format) = format {
+                *format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(
+                    crate::resource::concrete_srv_format(own) as i32,
+                );
+            }
+        }
+        return true;
     }
     // A view of a target whose format the host refuses, in the title's
     // format: in the stand-in the host copy has.
@@ -1758,10 +1765,14 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         once!(view, own, "view format of another family");
         return false;
     }
-    if let Some(format) = format
-        && !typeless
-    {
-        *format = d.Format;
+    if let Some(format) = format {
+        if !typeless {
+            *format = d.Format;
+        } else if crate::resource::is_typeless(view) {
+            *format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(
+                crate::resource::concrete_srv_format(view) as i32,
+            );
+        }
     }
     true
 }

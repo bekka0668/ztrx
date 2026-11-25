@@ -606,6 +606,30 @@ pub(crate) fn family(format: u32) -> u32 {
     }
 }
 
+/// Whether a format is the root typeless format of a multi-format family.
+pub(crate) fn is_typeless(format: u32) -> bool {
+    format != 0
+        && family(format) == format
+        && format.checked_add(1).is_some_and(|f| family(f) == format)
+}
+
+/// A concrete shader-readable format for a typeless format, resolving depth
+/// families to their legal depth SRV format (not their DSV attachment format)
+/// and color families to their primary typed view format.
+pub(crate) fn concrete_srv_format(format: u32) -> u32 {
+    match format {
+        19 => 21, // R32G8X24_TYPELESS -> R32_FLOAT_X8X24_TYPELESS (depth SRV, not DSV 20)
+        44 => 46, // R24G8_TYPELESS -> R24_UNORM_X8_TYPELESS (depth SRV, not DSV 45)
+        39 => 41, // R32_TYPELESS -> R32_FLOAT (SRV, not DSV 40)
+        53 => 56, // R16_TYPELESS -> R16_UNORM (depth SRV, not DSV 55)
+        90 => 87, // B8G8R8A8_TYPELESS -> B8G8R8A8_UNORM
+        92 => 88, // B8G8R8X8_TYPELESS -> B8G8R8X8_UNORM
+        94 => 95, // BC6H_TYPELESS -> BC6H_UF16
+        f if is_typeless(f) => f + 1,
+        f => f,
+    }
+}
+
 /// sRGB formats and their linear twins.
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 

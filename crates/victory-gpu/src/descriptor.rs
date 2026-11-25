@@ -226,22 +226,28 @@ impl RtvRecord {
     #[cfg(windows)]
     fn host_desc<T>(&self, dimension: u32) -> Option<T> {
         assert!(size_of::<T>() <= size_of::<[u32; 6]>());
-        let mut words = if self.described != 0 {
-            self.desc
+        let words = self.host_words(dimension, || crate::resource::view_format(self.resource))?;
+        // SAFETY: both host view descriptions are 24 bytes in this layout.
+        Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
+    }
+
+    /// [`RtvRecord::host_desc`]'s words; `own` is the format a view of the
+    /// resource must name if its host copy is typeless (none if typed).
+    #[cfg(windows)]
+    fn host_words(&self, dimension: u32, own: impl FnOnce() -> Option<u32>) -> Option<[u32; 6]> {
+        let mut words = if self.described == 0 {
+            [own()?, dimension, 0, 0, 0, 0]
         } else {
-            [
-                crate::resource::view_format(self.resource)?,
-                dimension,
-                0,
-                0,
-                0,
-                0,
-            ]
+            let mut words = self.desc;
+            // "The resource's format" (unknown) names none to a typeless copy.
+            if words[0] == 0 {
+                words[0] = own().unwrap_or(0);
+            }
+            words
         };
         // A target or depth view: of a target, in its stand-in format.
         words[0] = crate::resource::target_format(crate::resource::pc_format(words[0]));
-        // SAFETY: both host view descriptions are 24 bytes in this layout.
-        Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
+        Some(words)
     }
 }
 

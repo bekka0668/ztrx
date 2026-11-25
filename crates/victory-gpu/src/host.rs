@@ -4309,6 +4309,30 @@ impl Host {
         }
     }
 
+    /// A null render target view, for a slot whose texture the host cannot
+    /// render to (no view recorded, no host copy, or a copy made without
+    /// that use): draws write nothing there, and the other targets keep
+    /// their slots. In `format` (the title's view format) where the host
+    /// renders to it, so it matches the pipeline's target formats; else in
+    /// `R8G8B8A8_UNORM`.
+    pub(crate) fn null_rtv(&self, format: Option<DXGI_FORMAT>) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        let desc = D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: format
+                .filter(|&f| renders_format(f))
+                .unwrap_or(DXGI_FORMAT_R8G8B8A8_UNORM),
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+        unsafe {
+            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
+            handle.ptr += (slot * self.rtv_size) as usize;
+            self.device.CreateRenderTargetView(None, Some(&desc), handle);
+            handle
+        }
+    }
+
     /// A host depth view of `resource`, valid until it is recorded.
     pub(crate) fn dsv(
         &self,
@@ -4328,6 +4352,19 @@ impl Host {
 }
 
 impl HostList {
+    /// The current state established by this list. A texture the list has
+    /// never used can arrive in a different state at submission.
+    pub(crate) fn tracked_texture_state(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+    ) -> Option<u32> {
+        self.states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(std::sync::Arc::as_ptr(copy) as usize))
+            .map(|&(_, last, _)| last)
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -6056,6 +6093,43 @@ fn title_window() -> Option<HWND> {
 pub(crate) fn legal_state(texture: &ID3D12Resource, state: u32) -> u32 {
     // SAFETY: a plain query.
     legal_for(unsafe { texture.GetDesc() }.Flags.0 as u32, state)
+}
+
+/// Whether the host renders to `format` (`D3D12_FORMAT_SUPPORT1_RENDER_TARGET`),
+/// asked once per format.
+pub(crate) fn renders_format(format: DXGI_FORMAT) -> bool {
+    static KNOWN: Mutex<Vec<(i32, bool)>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format.0) {
+        return ok;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: format,
+        ..Default::default()
+    };
+    let ok = format != DXGI_FORMAT_UNKNOWN
+        && host().is_some_and(|h| {
+            // SAFETY: a plain query into a struct of its size.
+            unsafe {
+                h.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of_val(&support) as u32,
+                )
+            }
+            .is_ok()
+                && support.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0
+        });
+    known.push((format.0, ok));
+    ok
+}
+
+/// Whether the host copy of a texture can be a render target: not when the
+/// host refused that use for its format and the copy was made without it.
+pub(crate) fn renders_to(texture: &ID3D12Resource) -> bool {
+    // SAFETY: a plain query.
+    let flags = unsafe { texture.GetDesc() }.Flags;
+    flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 != 0
 }
 
 /// [`legal_state`] for a texture with resource flags `flags`.

@@ -512,29 +512,35 @@ impl State {
         self.targets_set = true;
         self.targets.clear();
         let mut rtvs = Vec::new();
+        // A target the host cannot bind gets a null view in its slot: the
+        // title's slots are positional (`SV_Target<n>`), so skipping one
+        // would move every later target to the wrong output.
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
                     handle = format_args!("{h:#x}"),
-                    "render target without a recorded view"
+                    "render target without a recorded view: a null view in its slot"
                 );
+                rtvs.push(host.null_rtv(None));
                 continue;
             };
+            let format = record.desc().map(|d| d.Format);
             let Some(texture) = crate::resource::host_resource(record.resource) else {
-                // A typed null view (or a target without a host copy) still
-                // takes its slot: left out, the next live target would move
-                // into it and the pixel shader's outputs reach the wrong
-                // targets.
-                // shortcut: a view without a description or a format has no
-                // null view to stand for it and is left out, as before.
-                let null = record
-                    .desc()
-                    .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
-                if let Some(desc) = null {
-                    rtvs.push(host.rtv(None, Some(&desc)));
-                }
+                once!(
+                    resource = format_args!("{:#x}", record.resource as usize),
+                    "render target without a host texture: a null view in its slot"
+                );
+                rtvs.push(host.null_rtv(format));
                 continue;
             };
+            if !crate::host::renders_to(texture) {
+                once!(
+                    resource = format_args!("{:#x}", record.resource as usize),
+                    "render target the host cannot render to: a null view in its slot"
+                );
+                rtvs.push(host.null_rtv(format));
+                continue;
+            }
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
@@ -1875,7 +1881,7 @@ impl State {
         let mut fresh: Vec<u8> = used
             .iter()
             .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
+            .filter(|u| matches!(u.kind, ResourceType::Cbv | ResourceType::Srv))
             .map(|u| u.slot)
             .collect();
         // Tables reaching past a host heap smaller than the title's (the
@@ -1953,6 +1959,9 @@ impl State {
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
+                for u in entries {
+                    self.table_entry(list, u, compute);
+                }
                 continue;
             }
             // The table and what its entries hold (record words).
@@ -1988,9 +1997,10 @@ impl State {
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
-                // No room: the draw must not run with the title's own
-                // offsets (slots never made for it); `bind` drops it.
-                made.push((slot, u32::MAX));
+                once!(n, "descriptor table did not fit in command-list slots");
+                for u in entries {
+                    self.table_entry(list, u, compute);
+                }
                 continue;
             };
             self.fresh_tables.insert(key, first);
