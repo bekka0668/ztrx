@@ -901,6 +901,41 @@ pub(crate) fn dsv_record(handle: u64) -> Option<RtvRecord> {
     tagged_record(handle, DSV_TAG)
 }
 
+/// What a clear of the unordered access view recorded at `handle` takes: a
+/// CPU handle of a host descriptor for it, and a GPU handle in a
+/// shader-visible heap the list has bound. `Err` says what was missing, for
+/// a run's log: the record is no view of ours, not a view shaders write, one
+/// the host cannot make, or one no bound heap of the title shows.
+///
+/// shortcut: the GPU handle is the title heap's own host mirror, so a title
+/// heap that is not shader visible has no mirror and its clears are dropped
+/// (logged). Giving them a heap of ours would mean binding it for the
+/// command and putting the title's back before the next draw.
+#[cfg(windows)]
+pub(crate) fn clear_uav_handles(
+    handle: u64,
+) -> Result<
+    (
+        windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE,
+        windows::Win32::Graphics::Direct3D12::D3D12_GPU_DESCRIPTOR_HANDLE,
+    ),
+    &'static str,
+> {
+    let view = view(handle).ok_or("no view of ours is recorded at its handles")?;
+    if !matches!(view, View::Unordered(..) | View::Placed(true, ..)) {
+        return Err("the view at its handles is not an unordered access view");
+    }
+    let cpu = host::clear_view(&view).ok_or("the host cannot make a view of it")?;
+    let (heap, index) = shader_slot(handle)
+        .ok_or("no shader-visible heap of the title holds its handles")?;
+    let host_heap = heap.host().ok_or("the host has no heap behind theirs")?;
+    // The title's own view, made now if a draw has not asked for it yet.
+    host_heap
+        .mirror(index, handle, true)
+        .ok_or("the mirror of it is not made")?;
+    Ok((cpu, host_heap.gpu_handle(index)))
+}
+
 fn tagged_record(handle: u64, tag: u32) -> Option<RtvRecord> {
     if handle == 0 {
         return None;

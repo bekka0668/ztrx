@@ -1296,6 +1296,206 @@ extern "system" fn clear_dsv(
     let _ = (this, handle, flags, depth, stencil, count, rects);
 }
 
+/// The host resource a clear of `resource` runs on: a texture's host copy,
+/// or the host copy of a buffer's memory (where its views point). A depth
+/// texture's unordered access is a colour twin's, which this does not hand
+/// back: such a clear is skipped below.
+#[cfg(windows)]
+fn clear_target(resource: This) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    if resource.is_null() {
+        return None;
+    }
+    if let Some(texture) = crate::resource::host_resource(resource) {
+        return Some(texture.clone());
+    }
+    let (data, len) = crate::resource::buffer_bytes(resource)?;
+    Some(crate::shadow::find(data as u64, len)?.buffer.clone())
+}
+
+/// Whether a clear of `resource` is left for later: one of a depth
+/// texture's unordered access, which the host makes as a view of its colour
+/// twin (so the resource to clear is not the one the title names).
+/// shortcut: no title seen clears a depth texture through a view.
+#[cfg(windows)]
+fn clear_skipped(resource: This) -> bool {
+    crate::resource::twin_resource(resource).is_some()
+}
+
+/// What a clear takes once its view, its heaps and its resource are found.
+#[cfg(windows)]
+struct ClearReady {
+    cpu: windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE,
+    gpu: windows::Win32::Graphics::Direct3D12::D3D12_GPU_DESCRIPTOR_HANDLE,
+    texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+}
+
+/// Why a clear that arrived was not recorded, in the log: the slot limits
+/// how many lines of that kind are written (see [`clear_dropped`]), and the
+/// text says what was missing. 0: no list or no values; 1: the view; 2: the
+/// resource.
+#[cfg(windows)]
+type ClearDropped = (usize, &'static str);
+
+/// Resolves a clear's view, heap and resource, or says why it cannot.
+#[cfg(windows)]
+fn clear_ready(
+    list: &crate::host::HostList,
+    view_cpu: u64,
+    resource: This,
+) -> Result<ClearReady, ClearDropped> {
+    let (cpu, gpu) = crate::descriptor::clear_uav_handles(view_cpu).map_err(|why| (1, why))?;
+    if clear_skipped(resource) {
+        return Err((
+            2,
+            "its view is a depth texture's colour twin, which is not cleared yet",
+        ));
+    }
+    let texture = clear_target(resource).ok_or((2, "the resource has no host copy"))?;
+    list.keep(&texture);
+    // A clear reads the resource as unordered access.
+    const UNORDERED_ACCESS: u32 = 0x8;
+    ensure_state(list, resource, UNORDERED_ACCESS);
+    Ok(ClearReady { cpu, gpu, texture })
+}
+
+/// Logs a clear that arrived and was not recorded, with both handles as the
+/// title passed them, so a run's log tells a method the title never calls
+/// (no line at all) from one it calls and we drop. The first 16 lines of
+/// each `slot` are written: a title that clears every frame would flood an
+/// hour's log otherwise.
+#[cfg(windows)]
+fn clear_dropped(
+    method: &'static str,
+    slot: usize,
+    view_gpu: u64,
+    view_cpu: u64,
+    resource: This,
+    why: &'static str,
+) {
+    static DROPPED: [std::sync::atomic::AtomicU32; 3] =
+        [const { std::sync::atomic::AtomicU32::new(0) }; 3];
+    let seen = DROPPED
+        .get(slot)
+        .map_or(0, |count| count.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    if seen < 16 {
+        tracing::warn!(
+            method,
+            gpu = format_args!("{view_gpu:#x}"),
+            cpu = format_args!("{view_cpu:#x}"),
+            resource = format_args!("{:#x}", resource as usize),
+            why,
+            seen = seen + 1,
+            "unordered access clear dropped"
+        );
+    }
+}
+
+/// `ClearUnorderedAccessViewUint(gpu handle, cpu handle, resource, values,
+/// count, rects)`, the host's own declaration (the console's list declares
+/// its methods as the host does). The clear runs on host descriptors of the
+/// view the title recorded at its handles, which the title passes both of
+/// (they are the same address on the console): the CPU handle ours, the GPU
+/// handle the title heap's own host mirror, whose heap it binds itself.
+extern "system" fn clear_uav_uint(
+    this: This,
+    view_gpu: u64,
+    view_cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    {
+        const METHOD: &str = "ClearUnorderedAccessViewUint";
+        let Some(list) = host_list(this) else {
+            clear_dropped(METHOD, 0, view_gpu, view_cpu, resource, "no host GPU to record on");
+            return;
+        };
+        // SAFETY: the title passes four values (null is tolerated).
+        let Some(values) = (unsafe { values.as_ref() }) else {
+            clear_dropped(METHOD, 0, view_gpu, view_cpu, resource, "its values are null");
+            return;
+        };
+        let ready = match clear_ready(list, view_cpu, resource) {
+            Ok(ready) => ready,
+            Err((slot, why)) => {
+                clear_dropped(METHOD, slot, view_gpu, view_cpu, resource, why);
+                return;
+            }
+        };
+        let rects: &[windows::Win32::Foundation::RECT] = if count > 0 && !rects.is_null() {
+            // SAFETY: the title passes `count` rectangles, laid out as the host's.
+            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+        } else {
+            &[]
+        };
+        // SAFETY: an open list, a live resource in the unordered-access
+        // state, and two views of it.
+        unsafe {
+            list.list
+                .ClearUnorderedAccessViewUint(ready.gpu, ready.cpu, &ready.texture, values, rects);
+        }
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| {
+            format!("clear uav uint {resource:?} values {values:?} rects {}", rects.len())
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = (this, view_gpu, view_cpu, resource, values, count, rects);
+}
+
+/// `ClearUnorderedAccessViewFloat(gpu handle, cpu handle, resource, values,
+/// count, rects)`, as [`clear_uav_uint`].
+extern "system" fn clear_uav_float(
+    this: This,
+    view_gpu: u64,
+    view_cpu: u64,
+    resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    {
+        const METHOD: &str = "ClearUnorderedAccessViewFloat";
+        let Some(list) = host_list(this) else {
+            clear_dropped(METHOD, 0, view_gpu, view_cpu, resource, "no host GPU to record on");
+            return;
+        };
+        // SAFETY: the title passes four values (null is tolerated).
+        let Some(values) = (unsafe { values.as_ref() }) else {
+            clear_dropped(METHOD, 0, view_gpu, view_cpu, resource, "its values are null");
+            return;
+        };
+        let ready = match clear_ready(list, view_cpu, resource) {
+            Ok(ready) => ready,
+            Err((slot, why)) => {
+                clear_dropped(METHOD, slot, view_gpu, view_cpu, resource, why);
+                return;
+            }
+        };
+        let rects: &[windows::Win32::Foundation::RECT] = if count > 0 && !rects.is_null() {
+            // SAFETY: the title passes `count` rectangles, laid out as the host's.
+            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+        } else {
+            &[]
+        };
+        // SAFETY: an open list, a live resource in the unordered-access
+        // state, and two views of it.
+        unsafe {
+            list.list
+                .ClearUnorderedAccessViewFloat(ready.gpu, ready.cpu, &ready.texture, values, rects);
+        }
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| {
+            format!("clear uav float {resource:?} values {values:?} rects {}", rects.len())
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = (this, view_gpu, view_cpu, resource, values, count, rects);
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct DiscardRegion {
@@ -2214,7 +2414,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 53] = [
+const METHODS: [(usize, *const ()); 55] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -2255,6 +2455,8 @@ const METHODS: [(usize, *const ()); 53] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
+    (53, clear_uav_uint as *const ()),            // 0x1a8
+    (54, clear_uav_float as *const ()),           // 0x1b0
     (55, discard_resource as *const ()),          // 0x1b8
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
@@ -2335,6 +2537,21 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// The unordered access clears sit where the console's list has them:
+    /// after the render target clear, before DiscardResource.
+    #[test]
+    fn the_unordered_access_clears_are_in_the_console_slots() {
+        let table = list_table(false);
+        assert_eq!(table[53], clear_uav_uint as *const (), "0x1a8");
+        assert_eq!(table[54], clear_uav_float as *const (), "0x1b0");
+        assert_eq!(table[55], discard_resource as *const (), "0x1b8");
+        // Newer titles' lists move nothing before ExecuteIndirect (0x1d8).
+        let newer = list_table(true);
+        assert_eq!(newer[53], clear_uav_uint as *const (), "0x1a8");
+        assert_eq!(newer[54], clear_uav_float as *const (), "0x1b0");
+        assert_eq!(newer[55], discard_resource as *const (), "0x1b8");
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

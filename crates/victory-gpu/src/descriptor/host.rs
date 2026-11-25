@@ -2013,6 +2013,15 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     }
 }
 
+/// A host descriptor of `view` for a clear of it: made in a ring of ours
+/// that is not shader visible (where the CPU handle a clear takes must be).
+/// `None` if the host cannot make a view of it.
+pub(crate) fn clear_view(view: &View) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    let at = host()?.clear_view_slot();
+    make(view, at)?;
+    Some(at)
+}
+
 /// Writes of a slot with another view of the placed texture it showed,
 /// since the start: the slot kept showing the old view.
 pub(crate) static KEPT_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

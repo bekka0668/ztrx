@@ -35,6 +35,9 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
+/// Clears of unordered access views are rare: their descriptors need a
+/// short ring.
+const CLEAR_RING: u32 = 64;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -49,6 +52,11 @@ pub(crate) struct Host {
     dsvs: ID3D12DescriptorHeap,
     dsv_size: u32,
     next_dsv: AtomicU32,
+    /// A ring of view descriptors for clears, not shader visible: where the
+    /// CPU handle a clear takes must be.
+    clear_views: ID3D12DescriptorHeap,
+    clear_view_size: u32,
+    next_clear: AtomicU32,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
@@ -600,6 +608,14 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        let clear_views: ID3D12DescriptorHeap =
+            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: CLEAR_RING,
+                ..Default::default()
+            })?;
+        let clear_view_size =
+            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
@@ -615,6 +631,9 @@ fn create() -> windows::core::Result<Host> {
             dsvs,
             dsv_size,
             next_dsv: AtomicU32::new(0),
+            clear_views,
+            clear_view_size,
+            next_clear: AtomicU32::new(0),
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
@@ -4331,6 +4350,17 @@ impl Host {
             self.device.CreateRenderTargetView(None, Some(&desc), handle);
             handle
         }
+    }
+
+    /// The next slot of the clear ring: where a clear's descriptor is made,
+    /// in a heap that is not shader visible (as the call requires), valid
+    /// until it is recorded.
+    pub(crate) fn clear_view_slot(&self) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let slot = self.next_clear.fetch_add(1, Ordering::Relaxed) % CLEAR_RING;
+        // SAFETY: a heap of ours.
+        let mut handle = unsafe { self.clear_views.GetCPUDescriptorHandleForHeapStart() };
+        handle.ptr += (slot * self.clear_view_size) as usize;
+        handle
     }
 
     /// A host depth view of `resource`, valid until it is recorded.
