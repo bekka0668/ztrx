@@ -9,11 +9,17 @@
 //!
 //! A first use queues the pipeline and waits for it within a budget per
 //! frame, so the cheap ones (menus, one-off passes such as a colour-grading
-//! bake) are there at once as before; past the budget a draw or dispatch
-//! whose pipeline is not ready is dropped, as an untranslated one is.
+//! bake) are there at once as before. Past that budget a draw or dispatch
+//! waits for its pipeline out of a second, larger budget per frame rather
+//! than being dropped: a drop loses the title's geometry for the frame,
+//! while the wait only costs time in a frame that already runs at a few
+//! frames a second, and the pipeline is made once. Only a draw whose extra
+//! budget is spent, or whose pipeline the host refuses, is dropped.
 //!
-//! The default budget is half a second per title frame. A pass the title
-//! runs only once and whose pipeline takes longer is lost.
+//! The default budgets are half a second and twenty seconds per title
+//! frame (`VICTORY_PIPELINE_WAIT_MS`, `VICTORY_PIPELINE_HARD_WAIT_MS`, three
+//! seconds: longer and the title's own watchdog may end the run at a scene
+//! change, where over a thousand pipelines are first used at once).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -159,18 +165,33 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// What was waited of the frame's own budget, and of the extra one.
+static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+static WAITED_OUT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let budget = wait_budget();
     if budget.is_zero() {
         return;
     }
+    wait_shared(p, frame, budget, &SPENT);
+}
+
+/// Waits for `p` while frame `frame` has `budget` left, taking it from
+/// `spent` (one budget for the frame, over all threads); how long it
+/// waited, for the counters.
+fn wait_shared(
+    p: &Pending,
+    frame: u64,
+    budget: Duration,
+    spent: &Mutex<(u64, Duration)>,
+) -> Duration {
+    let shared = shared_budget();
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
-    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
-    let shared = shared_budget();
     let left = {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = spent.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
@@ -181,7 +202,7 @@ fn wait(p: &Pending, frame: u64) {
         left
     };
     if left.is_zero() {
-        return;
+        return Duration::ZERO;
     }
     let started = Instant::now();
     let (lock, done) = &DONE;
@@ -196,7 +217,7 @@ fn wait(p: &Pending, frame: u64) {
     drop(held);
     let waited = started.elapsed().min(left);
     {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = spent.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
             if shared {
@@ -211,6 +232,42 @@ fn wait(p: &Pending, frame: u64) {
         crate::copystat::C::PipelineWaitUs,
         started.elapsed().as_micros() as u64,
     );
+    waited
+}
+
+/// Extra waiting allowed per title frame, over all threads, for pipelines
+/// the frame's own budget did not cover: a draw whose pipeline is still
+/// being made waits for it rather than being dropped, since a dropped draw
+/// loses the title's geometry for that frame while the wait only costs the
+/// frame's time (the pipeline is made once). Zero restores dropping at the
+/// frame's own budget.
+fn hard_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let millis = std::env::var("VICTORY_PIPELINE_HARD_WAIT_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(3_000);
+        tracing::info!(millis, "host pipeline extra wait per frame");
+        Duration::from_millis(millis)
+    })
+}
+
+/// The host pipeline for a draw or dispatch: as [`ready`], but one still
+/// being made is waited for (past the frame's own budget, within the extra
+/// one) instead of being left to be dropped. `None` once the pipeline is
+/// known to have no host pipeline, or the extra budget is spent.
+pub(crate) fn ready_for_draw(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    let frame = crate::frame::current();
+    let made = ready(p);
+    if p.made.get().is_some() {
+        return made;
+    }
+    let budget = hard_budget();
+    if !budget.is_zero() {
+        wait_shared(p, frame, budget, &WAITED_OUT);
+    }
+    p.made.get()?.as_ref()
 }
 
 const NOT_QUEUED: u8 = 0;

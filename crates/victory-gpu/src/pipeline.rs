@@ -384,14 +384,15 @@ pub(crate) fn bound(this: This) {
 }
 
 /// The host pipeline of a title pipeline; `None` if one of its shaders does
-/// not translate, the host refuses it, or it is still being made (its first
-/// use starts that, see [`make`]).
+/// not translate or the host refuses it. A pipeline still being made is
+/// waited for rather than returned as `None` (its first use starts that, see
+/// [`make`]): a draw dropped for want of it loses the title's geometry.
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
     }
-    make::ready(&pipeline(this).host)
+    make::ready_for_draw(&pipeline(this).host)
 }
 
 /// Host pipelines queued and not made yet.

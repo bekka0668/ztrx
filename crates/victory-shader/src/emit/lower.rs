@@ -2571,6 +2571,21 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// Says once per table dword that a descriptor is read only as numbers,
+    /// so what the program sees is this approximation (its place in the
+    /// table, as lane-copied descriptors get), not the console's address.
+    fn note_data_only(&mut self, at: u32) {
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        static SAID: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+        let said = SAID.get_or_init(|| Mutex::new(HashSet::new()));
+        if said.lock().unwrap_or_else(|e| e.into_inner()).insert(at) {
+            eprintln!(
+                "DESCRIPTOR-DATA-ONLY dword={at}: its dwords stand in as their place in the table"
+            );
+        }
+    }
+
     /// The title address (low dword, bits from 32 up) of the buffer view
     /// whose descriptor the scalar load at `site` reads from the start of
     /// a table entry, as the host tells it when it binds (`shader.rs`
@@ -5575,6 +5590,20 @@ impl<'a> Lower<'a> {
                             }
                         }
                     }
+                }
+                return Ok(());
+            }
+            // A descriptor whose dwords are only ever read as numbers (a slot key, a
+            // comparison of two descriptors): its dwords stand in as their place in the
+            // table, as lane-copied ones do, rather than the whole draw being dropped.
+            // Two descriptors of one table compare equal and of another differ, as their
+            // addresses do on the console.
+            if let Some(a) = self.scalar.get(&site).copied() {
+                let at = a.offset / 4;
+                self.note_data_only(at);
+                for k in 0..count {
+                    let x = self.s.m.i32(at + k);
+                    self.write(inst, Reg::S(code + k as u8), x, None);
                 }
                 return Ok(());
             }

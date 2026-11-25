@@ -454,9 +454,11 @@ mod card_tests {
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
 /// beside the submitting thread and outside the submission lock
-/// (`VICTORY_RELAY=1` or `2`; off by default; not with kept snapshots,
-/// [`keeps`]). `crate::host::relay` says what it does; here it changes
-/// what a copy keeps:
+/// (`VICTORY_RELAY=1` or `2`; off by default, since a released host object
+/// is let go of later than the title releases it and a title that decommits
+/// pages behind it would find them still in use; not with kept snapshots,
+/// [`keeps`]). `crate::host::relay` says what it does; here it changes what
+/// a copy keeps:
 ///
 /// - the ranges shaders may be writing are counted per submission
 ///   ([`Flights`]): a range two flights declared stays closed to refreshes
@@ -937,7 +939,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 
 /// Whether the snapshots of a submission's shader-written ranges, and the
 /// compare that finds what the shaders wrote, run on several threads
-/// across ranges (`VICTORY_WIDE_BACK=1`; off by default).
+/// across ranges (`VICTORY_WIDE_BACK`; on by default, `0` turns it off).
 ///
 /// Both ran range by range on the submitting thread, a range on several
 /// threads only if it was 16 MiB or more. The ranges left on the CPU's side
@@ -958,7 +960,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 /// lists only afterwards).
 pub(crate) fn wide_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
 }
 
 type Job = Box<dyn FnOnce() + Send>;

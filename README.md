@@ -42,10 +42,17 @@ powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game fold
 (a DualShock/DualSense through DS4Windows works). With no pad connected the
 keyboard acts as one while the game window has focus.
 
-## Faster settings (optional, off by default)
 
-`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1` cut frame
-time on the test machines. Set them in PowerShell before running the script.
+
+## Speed
+
+The overlapping submission path is the default now: the copy-back of what
+shaders wrote runs on a thread of its own (`VICTORY_RELAY=2`), a submission
+is sent without waiting for the one before (`VICTORY_LATE_WAIT=3`), and the
+snapshots and compares over shader-written ranges run on several threads
+(`VICTORY_WIDE_BACK=1`). `VICTORY_RELAY=0` and `VICTORY_LATE_WAIT=0` go back
+to one submission prepared, waited for and copied back at a time, which is
+slower but settles every submission before the next is prepared.
 
 ## Debugging switches
 
@@ -55,6 +62,7 @@ time on the test machines. Set them in PowerShell before running the script.
 | `VICTORY_KEYS=30:Enter,35:X` | press keys at those seconds (diagnostics build) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, report the commands in flight |
 | `VICTORY_PIPELINE_WAIT_MS=24` | shorter per-frame wait for pipelines still being built |
+| `VICTORY_PIPELINE_HARD_WAIT_MS=20000` | how long a draw then waits for its pipeline instead of being dropped (`0` drops as before) |
 
 Diagnostics build: `cargo build --profile diag -p victory --features diagnostics`
 

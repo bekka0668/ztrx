@@ -1690,7 +1690,9 @@ pub(crate) fn late() -> bool {
     late_stage() > 0
 }
 
-/// `VICTORY_LATE_WAIT`: 0 (off), 1, or 2 ([`late_exact`]).
+/// `VICTORY_LATE_WAIT`: 0 (off), 1, 2 ([`late_exact`]) or 3 (all of it,
+/// the default: the copy-back and the next frame's preparing overlap, which
+/// is most of the frame at a frame a second).
 fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| {
@@ -1698,11 +1700,13 @@ fn late_stage() -> u8 {
             return 0;
         }
         match std::env::var("VICTORY_LATE_WAIT").as_deref() {
+            Ok("0") => 0,
             Ok("1") => 1,
             Ok("2") => 2,
             Ok("3") => 3,
-            // The relay alone: on top of stage 3.
-            Err(_) if crate::shadow::relay() => 3,
+            // Unset: the fastest stage, unless kept snapshots turned it all
+            // off (or `VICTORY_RELAY=0`).
+            _ if crate::shadow::relay() => 3,
             _ => 0,
         }
     })
