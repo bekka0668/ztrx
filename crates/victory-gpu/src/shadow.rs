@@ -63,6 +63,11 @@ pub(crate) struct Shadow {
     /// Asks for the copy that gave no length (root views: they read from
     /// their address to the copy's end, whatever lies there).
     unsized_asks: AtomicU64,
+    /// For memory nothing watches ([`update_free`]): per [`WHOLE_CHUNK`] of
+    /// the copy, the frame it was last copied whole, and the number of our
+    /// last write at that moment (`crate::watch::mark`). Empty until the
+    /// copy turns out not to be write-watched.
+    whole: Mutex<Vec<(u64, u64)>>,
     /// A number no other copy has had. Its address is no name for a copy:
     /// one let go and another made may share it.
     id: u64,
@@ -850,6 +855,33 @@ fn give_back(v: Vec<u8>) {
 
 const NOT_WATCHED: u8 = 2;
 
+/// How much of a copy of memory nothing watches one entry of its
+/// [`Shadow::whole`] covers (1 MiB: fine enough that a write of ours brings
+/// back the megabytes around it and no more).
+const WHOLE_CHUNK: usize = 1 << 20;
+
+/// How many frames apart memory nothing watches is copied whole, at most
+/// (`VICTORY_UNWATCHED_FRAMES`, 2 by default; 1: every refresh, as before).
+///
+/// The kernel cannot be asked what the title wrote there, so such a copy was
+/// taken whole at every refresh: 30 ms a frame in the world. Copied every
+/// other frame instead, it is still brought up to date at once when a write
+/// of ours (a title buffer copy, a fill, a copy-back of what shaders wrote:
+/// `crate::watch::note_write`) touched it, and a write the title makes into
+/// it by itself is seen a frame late at most. Refreshed 120 frames apart
+/// instead, streamed geometry drew from stale buffers and runs ended in the
+/// card's silence (run 11); two frames is the middle that holds.
+fn unwatched_frames() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_UNWATCHED_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(2)
+    })
+}
+
 /// Where `a` and `b` (of one length) first differ, compared eight bytes at
 /// a time.
 fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
@@ -939,7 +971,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 
 /// Whether the snapshots of a submission's shader-written ranges, and the
 /// compare that finds what the shaders wrote, run on several threads
-/// across ranges (`VICTORY_WIDE_BACK`; on by default, `0` turns it off).
+/// across ranges (`VICTORY_WIDE_BACK=1`; off by default).
 ///
 /// Both ran range by range on the submitting thread, a range on several
 /// threads only if it was 16 MiB or more. The ranges left on the CPU's side
@@ -958,9 +990,14 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 /// preparing (a declared range is left alone by every refresh, the title's
 /// own copies write title memory and not the copy, and the card runs the
 /// lists only afterwards).
+///
+/// It stays a switch: the world runs with it on and with it off (2026-11-25)
+/// gave frame times within each other's spread (the title's own frames
+/// differ from one another by more than this saves), so it is neither
+/// claimed faster nor run by default. `VICTORY_WIDE_BACK=1` turns it on.
 pub(crate) fn wide_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_some_and(|v| v == "1"))
 }
 
 type Job = Box<dyn FnOnce() + Send>;
@@ -1715,6 +1752,7 @@ impl Shadow {
             used: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
+            whole: Mutex::default(),
             id: {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
                 NEXT.fetch_add(1, Ordering::Relaxed)
@@ -2402,14 +2440,68 @@ impl Shadow {
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
+        let every = unwatched_frames();
+        // Taken before the copy: a write of ours that lands while it runs
+        // leaves the copy stale, and it is copied again next time.
+        let mark = (every > 1).then(crate::watch::mark);
+        if mark.is_some() && !self.whole_due(from, to, every) {
+            return 0;
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        let copied = self.copy(from, to);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
-        to - from
+        crate::copystat::whole(from, (to - from) as u64, started.elapsed().as_micros() as u64);
+        if let Some(mark) = mark {
+            self.whole_copied(from, to, mark);
+        }
+        copied
+    }
+
+    /// For memory nothing watches: whether `[from, to)` is to be copied now,
+    /// `every` frames after the last whole copy of its chunks at the latest,
+    /// and at once where a write of ours touched one since.
+    fn whole_due(&self, from: usize, to: usize, every: u64) -> bool {
+        if from >= to {
+            return false;
+        }
+        let frame = crate::frame::current();
+        let base = self.start as usize;
+        let end = base + self.len as usize;
+        let (first, last) = (from / WHOLE_CHUNK, (to - 1) / WHOLE_CHUNK);
+        let mut whole = self.whole.lock().unwrap_or_else(|e| e.into_inner());
+        let need = self.len as usize / WHOLE_CHUNK + 1;
+        if whole.len() < need {
+            whole.resize(need, (0, 0));
+        }
+        (first..=last).any(|chunk| {
+            let (stamp, mark) = whole[chunk];
+            let lo = base + chunk * WHOLE_CHUNK;
+            let hi = (lo + WHOLE_CHUNK).min(end);
+            // Never copied, or copied long enough ago: copied; or written by
+            // us since (a title copy, a fill, a copy-back).
+            stamp == 0 || frame >= stamp + every || crate::watch::written_since(lo, hi, mark)
+        })
+    }
+
+    /// Notes `[from, to)` copied whole: every chunk it covers, and `mark`,
+    /// the number of our writes taken before the copy.
+    fn whole_copied(&self, from: usize, to: usize, mark: u64) {
+        if from >= to {
+            return;
+        }
+        let frame = crate::frame::current().max(1);
+        let (first, last) = (from / WHOLE_CHUNK, (to - 1) / WHOLE_CHUNK);
+        let mut whole = self.whole.lock().unwrap_or_else(|e| e.into_inner());
+        let need = self.len as usize / WHOLE_CHUNK + 1;
+        if whole.len() < need {
+            whole.resize(need, (0, 0));
+        }
+        for chunk in first..=last {
+            whole[chunk] = (frame, mark);
+        }
     }
 
     /// Copies the pages of `[from, to)` written after their last copy

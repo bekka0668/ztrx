@@ -223,6 +223,67 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
+/// The number of the last write we made into title memory (a title buffer
+/// copy, a fill of upload memory, a copy-back of what shaders wrote).
+static MARK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The pages we wrote since tracking began, by page number, and the mark of
+/// the write that last touched each. Memory nothing watches cannot be asked
+/// what the title wrote there; a copy of it that skips a refresh
+/// (`Shadow::update_free`) asks this instead, and copies at once where a
+/// write of ours touched it.
+static WROTE: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+
+/// The most pages [`WROTE`] keeps. Past that it starts over, and every copy
+/// that last took its bytes before it copies again.
+const WROTE_MAX: usize = 1 << 19;
+
+/// The mark at which [`WROTE`] last started over: a copy that took its bytes
+/// before it cannot be told what was written since.
+static CLEARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The number now: a copy that takes its bytes records it before the copy,
+/// and [`written_since`] says whether any write of ours came after.
+pub(crate) fn mark() -> u64 {
+    MARK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Notes that we wrote `[at, at + len)` of title memory.
+pub(crate) fn note_write(at: usize, len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if len == 0 || PAGE == 0 {
+        return;
+    }
+    let now = MARK.fetch_add(1, Relaxed) + 1;
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let mut wrote = WROTE.lock().unwrap_or_else(|e| e.into_inner());
+    if last - first >= WROTE_MAX || wrote.len() + (last - first) > WROTE_MAX {
+        // Full: started over, and said so, so that copies that took their
+        // bytes earlier copy again.
+        wrote.clear();
+        CLEARED.store(now, Relaxed);
+    }
+    for page in first..last {
+        wrote.insert(page, now);
+    }
+}
+
+/// Whether `[start, end)` holds a page we wrote after `mark` (a copy's
+/// [`mark`] from before its last whole copy). True where [`WROTE`] cannot
+/// say.
+pub(crate) fn written_since(start: usize, end: usize, mark: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if start >= end || PAGE == 0 {
+        return false;
+    }
+    if mark < CLEARED.load(Relaxed) {
+        return true;
+    }
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let wrote = WROTE.lock().unwrap_or_else(|e| e.into_inner());
+    wrote.range(first..last).any(|(_, &at)| at > mark)
+}
+
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`].

@@ -5159,6 +5159,9 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
+                    // And the copies of memory nothing watches, which ask
+                    // the journal for what we wrote (`watch::written_since`).
+                    crate::watch::note_write(dst, len);
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -5168,6 +5171,8 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    // Upload memory lives in the title's buffers too.
+                    crate::watch::note_write(dst, len);
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
@@ -5524,6 +5529,9 @@ fn direct_writes() -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // A write of ours into title memory: copies of memory nothing watches
+    // need not copy it again until this (`watch::written_since`).
+    crate::watch::note_write(dst as usize, len);
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
